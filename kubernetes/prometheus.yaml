@@ -1,0 +1,132 @@
+# (1) SERVICE: Exposes the AKI app to Prometheus
+apiVersion: v1
+kind: Service
+metadata:
+  name: aki-detection
+  namespace: aki
+  labels:
+    app: aki-detection
+spec:
+  selector:
+    app: aki-detection
+  ports:
+    - port: 8000
+      targetPort: 8000
+
+---
+# (2) CONFIGMAP: Holds the Prometheus configuration and alert rules
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-config
+  namespace: aki
+data:
+  prometheus.yaml: |
+    global:
+      scrape_interval: 5s
+      evaluation_interval: 5s
+
+    alerting:
+      alertmanagers:
+      - scheme: http
+        static_configs:
+        - targets:
+          - "alertmanager:9093"
+
+    rule_files:
+      - "/etc/prometheus/alert_rules.yaml"
+
+    scrape_configs:
+      - job_name: "aki-detection"
+        static_configs:
+          - targets: ["aki-detection:8000"]
+
+  alert_rules.yaml: |
+    groups:
+      - name: aki-production-alerts
+        rules:
+          # (A) CONNECTION DROP
+          - alert: MLLPConnectionLost
+            expr: aki_active_connections == 0
+            for: 2m
+            labels:
+              severity: critical
+            annotations:
+              summary: "CRITICAL: MLLP connection is down."
+              description: "The AKI system has 0 active connections. We are missing blood tests."
+          
+          # (B) SLA VIOLATION
+          - alert: SLALatencyBreach
+            expr: histogram_quantile(0.90, sum(rate(aki_e2e_latency_seconds_bucket[5m])) by (le)) > 3.0
+            for: 2m
+            labels:
+              severity: warning
+            annotations:
+              summary: "WARNING: Pager latency > 3s"
+              description: "The 90th percentile paging latency is above 3s."
+          
+          # (C) PAGER FAILURE
+          - alert: PagerRequestsFailing
+            expr: sum(rate(aki_pager_requests_total{status=~"error|timeout"}[2m])) > 0
+            for: 1m
+            labels:
+              severity: critical
+            annotations:
+              summary: "CRITICAL: Pager API is failing"
+              description: "The system is trying to send pages but receiving errors or timeouts from the simulator's endpoint."
+    
+          # (D) NETWORK FLAPPING
+          - alert: MLLPNetworkUnstable
+            expr: rate(aki_mllp_reconnects_total[5m]) > 0.5 or rate(aki_mllp_errors_total[5m]) > 0.5
+            for: 3m
+            labels:
+              severity: warning
+            annotations:
+              summary: "WARNING: High MLLP reconnect rate"
+              description: "The system is experiencing a high volume of socket drops, broken pipes, or timeouts."
+
+---
+# (3) DEPLOYMENT
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: prometheus
+  namespace: aki
+  labels:
+    app: prometheus
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: prometheus
+  template:
+    metadata:
+      labels:
+        app: prometheus
+    spec:
+      containers:
+      - name: prometheus
+        image: prom/prometheus:latest
+        ports:
+        - containerPort: 9090
+
+        volumeMounts:
+        - name: config-volume
+          mountPath: /etc/prometheus/prometheus.yml
+          subPath: prometheus.yaml
+        - name: config-volume
+          mountPath: /etc/prometheus/alert_rules.yaml
+          subPath: alert_rules.yaml
+
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "100m"
+          limits:
+            memory: "128Mi"
+            cpu: "100m"
+
+      volumes:
+      - name: config-volume
+        configMap:
+          name: prometheus-config

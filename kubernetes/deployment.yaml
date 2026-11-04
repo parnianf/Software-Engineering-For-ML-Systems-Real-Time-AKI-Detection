@@ -1,0 +1,97 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: aki-detection-state
+  namespace: aki
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: managed-csi
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: aki-detection
+  namespace: aki
+  labels:
+    app: aki-detection
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate  # required for file locking (e.g., pickle)
+  selector:
+    matchLabels:
+      app: aki-detection
+  template:
+    metadata:
+      labels:
+        app: aki-detection
+    spec:
+      # 1. INIT CONTAINER: Fetches history.csv
+      initContainers:
+      - name: copy-hospital-history
+        image: <registry>/hospital-history
+        volumeMounts:
+          - mountPath: "/data"
+            name: hospital-history
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "500m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+
+      # 2. APP CONTAINER
+      containers:
+      - name: aki-detection
+        image: <registry>/aki-detection:latest
+        imagePullPolicy: Always
+        command: ["python", "-m", "src.aki.app"]
+
+        env:
+        - name: MLLP_ADDRESS
+          value: hospital-simulator:8440
+        - name: PAGER_ADDRESS
+          value: hospital-simulator:8441
+        - name: PROMETHEUS_PORT
+          value: "8000"
+
+        - name: HISTORY_PATH
+          value: "/data/history.csv"
+        - name: PERSISTENCE_PATH
+          value: "/state/patients.pkl"
+        - name: JOURNAL_PATH
+          value: "/state/journal.jsonl"
+        - name: PYTHONUNBUFFERED
+          value: "1"
+
+        ports:
+        - name: http
+          containerPort: 8000
+
+        volumeMounts:
+          - mountPath: "/data"
+            name: hospital-history
+            readOnly: true
+          - mountPath: "/state"
+            name: aki-detection-state
+
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "500m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+
+      volumes:
+      - name: hospital-history
+        emptyDir:
+          sizeLimit: 50Mi
+      - name: aki-detection-state
+        persistentVolumeClaim:
+          claimName: aki-detection-state
